@@ -1,0 +1,249 @@
+# Reusable: build a Laravel application on the runner and deploy it over SSH.
+#
+# Composer (--no-dev) and front-end assets are built here, then the result is
+# copied to the server with rsync. The server only needs PHP, rsync and SSH —
+# no git, Composer or Node.js.
+#
+# Caller (.github/workflows/deploy.yml):
+#
+#   name: Deploy
+#   on:
+#     push:
+#       branches: [main]
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#   jobs:
+#     tests:                                   # remove if the app has no tests
+#       uses: kishor-rajbanshi/.github/.github/workflows/laravel-tests.yml@main
+#     deploy:
+#       needs: tests
+#       uses: kishor-rajbanshi/.github/.github/workflows/laravel-deploy.yml@main
+#       with:
+#         environment: production
+#       secrets: inherit
+#
+# Settings (repository level, or per GitHub Environment to override):
+#   Secret    SSH_KEY          Private key allowed to log in to the server
+#   Variable  HOST             Server hostname or IP
+#   Variable  PORT             SSH port (optional, default 22)
+#   Variable  USERNAME         SSH user
+#   Variable  BASE_PATH        Absolute path of the app on the server
+#   Variable  SSH_KNOWN_HOSTS  Output of `ssh-keyscan -p PORT HOST` (optional, recommended)
+#
+# The server keeps its own .env, storage/, bootstrap/cache/ and
+# database/database.sqlite; they are never overwritten or deleted. List extra
+# paths to protect in a `.deployignore` file (rsync exclude syntax).
+#
+# If a step fails after `php artisan down`, the app is left in maintenance
+# mode on purpose; fix the problem and re-run the workflow.
+
+name: Laravel deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: GitHub Environment to deploy to.
+        type: string
+        required: true
+      php-version:
+        description: PHP version to build with. Defaults to the server's PHP version.
+        type: string
+        default: ""
+      extensions:
+        description: PHP extensions for shivammathur/setup-php.
+        type: string
+        default: bcmath, ctype, curl, dom, fileinfo, gd, intl, mbstring, pdo, pdo_mysql, pdo_pgsql, pdo_sqlite, redis, xml, zip
+      build-assets:
+        description: Build front-end assets (auto = only if package.json exists).
+        type: string
+        default: auto
+      script:
+        description: Extra shell commands to run on the server after migrations.
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.APP_URL }}
+    concurrency:
+      group: deploy-${{ github.repository }}-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      HOST: ${{ vars.HOST }}
+      PORT: ${{ vars.PORT || '22' }}
+      USERNAME: ${{ vars.USERNAME }}
+      BASE_PATH: ${{ vars.BASE_PATH }}
+    steps:
+      - name: Check configuration
+        env:
+          HAS_KEY: ${{ secrets.SSH_KEY != '' }}
+        run: |
+          missing=""
+          [ "$HAS_KEY" = "true" ] || missing="$missing SSH_KEY(secret)"
+          for name in HOST USERNAME BASE_PATH; do
+            eval "value=\${$name}"
+            [ -n "$value" ] || missing="$missing $name(variable)"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing settings:$missing. Did the caller pass 'secrets: inherit'?"
+            exit 1
+          fi
+          case "$BASE_PATH" in
+            /*) ;;
+            *) echo "::error::BASE_PATH must be an absolute path."; exit 1 ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_KNOWN_HOSTS: ${{ vars.SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            echo "::warning::SSH_KNOWN_HOSTS is not set; trusting the host key from ssh-keyscan."
+            ssh-keyscan -p "$PORT" -H "$HOST" > ~/.ssh/known_hosts 2>/dev/null
+          fi
+
+          cat > ~/.ssh/config <<EOF
+          Host deploy
+            HostName $HOST
+            Port $PORT
+            User $USERNAME
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            ServerAliveInterval 30
+          EOF
+
+          ssh deploy true
+
+      - name: Detect PHP version
+        id: php
+        env:
+          PHP_VERSION: ${{ inputs.php-version }}
+        run: |
+          if [ -z "$PHP_VERSION" ]; then
+            PHP_VERSION=$(ssh deploy "php -r 'echo PHP_MAJOR_VERSION.\".\".PHP_MINOR_VERSION;'")
+          fi
+          echo "PHP $PHP_VERSION"
+          echo "version=$PHP_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ steps.php.outputs.version }}
+          extensions: ${{ inputs.extensions }}
+          coverage: none
+
+      - name: Install Composer dependencies
+        run: composer install --no-dev --optimize-autoloader --classmap-authoritative --prefer-dist --no-interaction --no-progress --no-scripts
+
+      - name: Detect front-end
+        id: frontend
+        env:
+          BUILD_ASSETS: ${{ inputs.build-assets }}
+        run: |
+          if [ "$BUILD_ASSETS" = "true" ] || { [ "$BUILD_ASSETS" = "auto" ] && [ -f package.json ]; }; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build front-end assets
+        if: steps.frontend.outputs.build == 'true'
+        uses: kishor-rajbanshi/.github/actions/build-assets@main
+
+      - name: Enable maintenance mode
+        run: |
+          ssh deploy BASE_PATH="'$BASE_PATH'" sh -s <<'EOF'
+          set -e
+          mkdir -p "$BASE_PATH"
+          cd "$BASE_PATH"
+          if [ -f artisan ] && [ -f vendor/autoload.php ] && [ -f .env ]; then
+            php artisan down --retry=15
+          else
+            echo "No running app found; first deploy."
+          fi
+          EOF
+
+      - name: Upload files
+        run: |
+          set -- \
+            --exclude=/.git/ \
+            --exclude=/.github/ \
+            --exclude=/node_modules/ \
+            --exclude=/.env \
+            --exclude=/storage/ \
+            --exclude=/bootstrap/cache/ \
+            --exclude=/public/storage \
+            --exclude=/public/hot \
+            --exclude=/database/database.sqlite \
+            --exclude=/.deployignore
+          [ -f .deployignore ] && set -- "$@" --exclude-from=.deployignore
+
+          rsync --archive --compress --delete --delete-delay --human-readable --stats \
+            "$@" ./ "deploy:$BASE_PATH/"
+
+      - name: Run post-deploy tasks
+        env:
+          EXTRA_SCRIPT: ${{ inputs.script }}
+        run: |
+          {
+            cat <<'EOF'
+          set -e
+          cd "$BASE_PATH"
+
+          mkdir -p bootstrap/cache storage/app/public storage/framework/cache/data \
+            storage/framework/sessions storage/framework/views storage/logs
+
+          if [ ! -f .env ]; then
+            echo "Error: $BASE_PATH/.env does not exist. Create it, then re-run the deployment." >&2
+            exit 1
+          fi
+
+          has_command() { php artisan list --raw 2>/dev/null | grep -q "^$1 "; }
+
+          php artisan package:discover
+          [ -e public/storage ] || php artisan storage:link
+          php artisan optimize
+          php artisan migrate --force
+          if has_command reload; then
+            php artisan reload
+          else
+            php artisan queue:restart
+          fi
+          EOF
+            printf '%s\n' "$EXTRA_SCRIPT"
+            echo 'php artisan up'
+          } | ssh deploy BASE_PATH="'$BASE_PATH'" sh -s
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy to \`${{ inputs.environment }}\`: ${{ job.status }}"
+            echo
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+            echo "- Server: \`$USERNAME@$HOST:$BASE_PATH\`"
+            echo "- PHP: \`${{ steps.php.outputs.version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

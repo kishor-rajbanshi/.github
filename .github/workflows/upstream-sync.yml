@@ -1,0 +1,165 @@
+# Reusable: merge an upstream repository's branch into this repository.
+#
+# - Already up to date  -> nothing happens.
+# - Merges cleanly      -> the merge commit is pushed to the target branch.
+# - Conflicts           -> the upstream branch is pushed to `upstream-sync/<branch>`
+#                          and a pull request is opened (or updated) and assigned
+#                          to the repository owner, who resolves it manually.
+#
+# Caller (.github/workflows/upstream-sync.yml):
+#
+#   name: Upstream sync
+#   on:
+#     schedule:
+#       - cron: "17 3 * * 1"   # weekly, Monday 03:17 UTC
+#     workflow_dispatch:
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     sync:
+#       if: github.repository == 'kishor-rajbanshi/laravel'
+#       uses: kishor-rajbanshi/.github/.github/workflows/upstream-sync.yml@main
+#       with:
+#         upstream-repository: laravel/laravel
+#       secrets:
+#         token: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
+#
+# `token` is needed whenever upstream changes files in .github/workflows/,
+# because GITHUB_TOKEN is never allowed to push those. Use a fine-grained PAT
+# limited to this repository with Contents, Pull requests and Workflows set
+# to read/write. Without it the run falls back to GITHUB_TOKEN.
+
+name: Upstream sync
+
+on:
+  workflow_call:
+    inputs:
+      upstream-repository:
+        description: Upstream repository as owner/name (e.g. laravel/laravel).
+        type: string
+        required: true
+      upstream-branch:
+        description: Upstream branch to merge. Defaults to the upstream default branch.
+        type: string
+        default: ""
+      branch:
+        description: Branch to merge into. Defaults to this repository's default branch.
+        type: string
+        default: ""
+    secrets:
+      token:
+        description: Token allowed to push workflow files (PAT or GitHub App token).
+        required: false
+    outputs:
+      result:
+        description: up-to-date, merged or conflict.
+        value: ${{ jobs.sync.outputs.result }}
+
+permissions: {}
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync with ${{ inputs.upstream-repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      result: ${{ steps.merge.outputs.result }}
+    env:
+      GH_TOKEN: ${{ secrets.token || github.token }}
+      UPSTREAM_REPOSITORY: ${{ inputs.upstream-repository }}
+      UPSTREAM_BRANCH: ${{ inputs.upstream-branch }}
+      TARGET_BRANCH: ${{ inputs.branch || github.event.repository.default_branch }}
+      HAS_TOKEN: ${{ secrets.token != '' }}
+    steps:
+      - name: Check token
+        if: env.HAS_TOKEN != 'true'
+        run: echo "::warning::No 'token' secret given; pushes that change .github/workflows/ will be rejected."
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.token || github.token }}
+
+      - name: Merge upstream
+        id: merge
+        run: |
+          set -eu
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          upstream_url="https://github.com/$UPSTREAM_REPOSITORY.git"
+
+          if [ -z "$UPSTREAM_BRANCH" ]; then
+            UPSTREAM_BRANCH=$(git ls-remote --symref "$upstream_url" HEAD | awk '/^ref:/ { sub("refs/heads/", "", $2); print $2 }')
+            [ -n "$UPSTREAM_BRANCH" ] || { echo "::error::Could not resolve the default branch of $UPSTREAM_REPOSITORY"; exit 1; }
+          fi
+          echo "Upstream: $UPSTREAM_REPOSITORY@$UPSTREAM_BRANCH -> $TARGET_BRANCH"
+
+          git remote add upstream "$upstream_url"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          upstream_sha=$(git rev-parse FETCH_HEAD)
+          short_sha=$(git rev-parse --short "$upstream_sha")
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "Already up to date with $UPSTREAM_REPOSITORY@$short_sha."
+            echo "result=up-to-date" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-edit -m "Merge $UPSTREAM_REPOSITORY@$UPSTREAM_BRANCH ($short_sha)" "$upstream_sha"; then
+            git push origin "HEAD:$TARGET_BRANCH"
+            echo "::notice::Merged $UPSTREAM_REPOSITORY@$short_sha into $TARGET_BRANCH."
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Conflicting files:"
+          conflicts="$RUNNER_TEMP/conflicts.txt"
+          body="$RUNNER_TEMP/body.md"
+          git diff --name-only --diff-filter=U > "$conflicts"
+          sed 's/^/  /' "$conflicts"
+          git merge --abort
+
+          sync_branch="upstream-sync/$UPSTREAM_BRANCH"
+          git push --force origin "$upstream_sha:refs/heads/$sync_branch"
+
+          {
+            echo "Merging \`$UPSTREAM_REPOSITORY@$UPSTREAM_BRANCH\` (\`$short_sha\`) into \`$TARGET_BRANCH\` has conflicts that need manual resolution."
+            echo
+            echo "**Conflicting files**"
+            echo
+            sed "s/.*/- \`&\`/" "$conflicts"
+            echo
+            echo "**Resolve locally**"
+            echo
+            echo "\`\`\`sh"
+            echo "git fetch origin && git switch $TARGET_BRANCH && git pull"
+            echo "git merge origin/$sync_branch"
+            echo "# fix conflicts, then:"
+            echo "git commit && git push"
+            echo "\`\`\`"
+            echo
+            echo "Pushing the merge to \`$TARGET_BRANCH\` closes this pull request automatically."
+          } > "$body"
+
+          title="Merge upstream $UPSTREAM_REPOSITORY@$UPSTREAM_BRANCH (conflicts)"
+          pr_url=$(gh pr list --head "$sync_branch" --base "$TARGET_BRANCH" --state open --json url --jq '.[0].url // empty')
+
+          if [ -n "$pr_url" ]; then
+            gh pr edit "$pr_url" --title "$title" --body-file "$body"
+          else
+            pr_url=$(gh pr create --head "$sync_branch" --base "$TARGET_BRANCH" --title "$title" --body-file "$body" --assignee "$GITHUB_REPOSITORY_OWNER")
+          fi
+
+          echo "::warning::Conflicts merging $UPSTREAM_REPOSITORY@$short_sha. See $pr_url"
+          echo "result=conflict" >> "$GITHUB_OUTPUT"

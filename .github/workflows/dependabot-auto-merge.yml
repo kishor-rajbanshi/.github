@@ -1,0 +1,67 @@
+# Reusable: approve and enable auto-merge on Dependabot pull requests.
+#
+# Caller (.github/workflows/dependabot-auto-merge.yml):
+#
+#   name: Dependabot auto-merge
+#   on: pull_request
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#   jobs:
+#     auto-merge:
+#       if: github.event.pull_request.user.login == 'dependabot[bot]'
+#       uses: kishor-rajbanshi/.github/.github/workflows/dependabot-auto-merge.yml@main
+#
+# Requires "Allow auto-merge" in the repository settings. With required status
+# checks on the target branch, the PR merges once they pass; without them it
+# merges immediately.
+
+name: Dependabot auto-merge
+
+on:
+  workflow_call:
+    inputs:
+      update-types:
+        description: Comma-separated update types to auto-merge.
+        type: string
+        default: version-update:semver-patch,version-update:semver-minor
+      merge-method:
+        description: merge, squash or rebase.
+        type: string
+        default: squash
+
+permissions: {}
+
+jobs:
+  auto-merge:
+    name: Auto-merge
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Approve and enable auto-merge
+        if: contains(format(',{0},', inputs.update-types), format(',{0},', steps.metadata.outputs.update-type))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          MERGE_METHOD: ${{ inputs.merge-method }}
+        run: |
+          case "$MERGE_METHOD" in
+            merge | squash | rebase) ;;
+            *) echo "::error::Invalid merge-method '$MERGE_METHOD'"; exit 1 ;;
+          esac
+
+          gh pr review --approve "$PR_URL" --body "Auto-approved: ${{ steps.metadata.outputs.update-type }}."
+          gh pr merge --auto "--$MERGE_METHOD" "$PR_URL"
+
+      - name: Skip
+        if: "!contains(format(',{0},', inputs.update-types), format(',{0},', steps.metadata.outputs.update-type))"
+        run: echo "::notice::'${{ steps.metadata.outputs.update-type }}' is not in update-types; leaving for manual review."

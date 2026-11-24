@@ -1,0 +1,100 @@
+# Reusable: run a Laravel application's test suite across PHP versions.
+#
+# Caller (.github/workflows/tests.yml):
+#
+#   name: Tests
+#   on:
+#     push:
+#       branches: [main, "*.x"]
+#     pull_request:
+#   permissions:
+#     contents: read
+#   jobs:
+#     tests:
+#       uses: kishor-rajbanshi/.github/.github/workflows/laravel-tests.yml@main
+#       with:
+#         php-versions: '["8.3", "8.4", "8.5"]'
+
+name: Laravel tests
+
+on:
+  workflow_call:
+    inputs:
+      php-versions:
+        description: JSON array of PHP versions.
+        type: string
+        default: '["8.4"]'
+      extensions:
+        description: PHP extensions for shivammathur/setup-php.
+        type: string
+        default: dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite
+      build-assets:
+        description: Build front-end assets before testing (auto = only if package.json exists).
+        type: string
+        default: auto
+      test-command:
+        description: Command that runs the tests.
+        type: string
+        default: php artisan test
+
+permissions: {}
+
+jobs:
+  tests:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        php: ${{ fromJSON(inputs.php-versions) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: ${{ inputs.extensions }}
+          coverage: none
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v6
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-php${{ matrix.php }}-${{ hashFiles('composer.json', 'composer.lock') }}
+          restore-keys: composer-${{ runner.os }}-php${{ matrix.php }}-
+
+      - name: Install Composer dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      - name: Detect front-end
+        id: frontend
+        env:
+          BUILD_ASSETS: ${{ inputs.build-assets }}
+        run: |
+          if [ "$BUILD_ASSETS" = "true" ] || { [ "$BUILD_ASSETS" = "auto" ] && [ -f package.json ]; }; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build front-end assets
+        if: steps.frontend.outputs.build == 'true'
+        uses: kishor-rajbanshi/.github/actions/build-assets@main
+
+      - name: Prepare environment
+        run: |
+          [ -f .env ] || cp .env.example .env
+          php artisan key:generate --force
+
+      - name: Run tests
+        run: ${{ inputs.test-command }}

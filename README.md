@@ -22,10 +22,29 @@ A repository overrides any of these by adding its own copy (in its root, `.githu
 
 ## Shared workflows
 
-Reusable workflows live in [`.github/workflows/`](.github/workflows) and are called from other repositories with:
+Reusable workflows live in [`.github/workflows/`](.github/workflows). Each file starts with a ready-to-copy caller example.
+
+| Workflow | What it does |
+| --- | --- |
+| [`laravel-tests.yml`](.github/workflows/laravel-tests.yml) | Runs `php artisan test` across a PHP version matrix, building front-end assets when `package.json` exists |
+| [`laravel-deploy.yml`](.github/workflows/laravel-deploy.yml) | Builds Composer (`--no-dev`) and assets on the runner, uploads with rsync over SSH, then runs migrations, `optimize` and `reload` on the server |
+| [`upstream-sync.yml`](.github/workflows/upstream-sync.yml) | Merges an upstream repository (e.g. `laravel/laravel`) into a fork; pushes clean merges, opens a PR on conflicts |
+| [`dependabot-auto-merge.yml`](.github/workflows/dependabot-auto-merge.yml) | Approves and auto-merges Dependabot patch/minor updates |
 
 ```yaml
 jobs:
-  example:
-    uses: kishor-rajbanshi/.github/.github/workflows/<workflow>.yml@main
+  tests:
+    uses: kishor-rajbanshi/.github/.github/workflows/laravel-tests.yml@main
+```
+
+Callers use `@main`, so changes here reach every repository immediately — keep them backwards compatible.
+
+## Shared actions
+
+| Action | What it does |
+| --- | --- |
+| [`actions/build-assets`](actions/build-assets/action.yml) | Detects bun / pnpm / yarn / npm from the lockfile, installs and runs `build` |
+
+```yaml
+- uses: kishor-rajbanshi/.github/actions/build-assets@main
 ```

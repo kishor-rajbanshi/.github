@@ -1,0 +1,118 @@
+name: Build front-end assets
+description: >
+  Detects the package manager from the lockfile (bun, pnpm, yarn or npm),
+  installs dependencies and runs the build script. Does nothing without package.json.
+
+inputs:
+  working-directory:
+    description: Directory containing package.json.
+    default: .
+  script:
+    description: package.json script to run.
+    default: build
+  node-version:
+    description: Node.js version. Defaults to .nvmrc / .node-version, else the latest LTS.
+    default: ""
+
+outputs:
+  package-manager:
+    description: bun, pnpm, yarn, npm or none.
+    value: ${{ steps.detect.outputs.manager }}
+
+runs:
+  using: composite
+  steps:
+    - name: Detect package manager
+      id: detect
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        NODE_VERSION: ${{ inputs.node-version }}
+      run: |
+        if [ ! -f package.json ]; then
+          manager=none
+        elif [ -f bun.lock ] || [ -f bun.lockb ]; then
+          manager=bun
+        elif [ -f pnpm-lock.yaml ]; then
+          manager=pnpm
+        elif [ -f yarn.lock ]; then
+          manager=yarn
+        else
+          manager=npm
+        fi
+        echo "manager=$manager" >> "$GITHUB_OUTPUT"
+
+        version_file=""
+        if [ -z "$NODE_VERSION" ]; then
+          for f in .nvmrc .node-version; do
+            if [ -f "$f" ]; then version_file="$(pwd)/$f"; break; fi
+          done
+          [ -n "$version_file" ] || NODE_VERSION="lts/*"
+        fi
+        echo "node-version=$NODE_VERSION" >> "$GITHUB_OUTPUT"
+        echo "node-version-file=$version_file" >> "$GITHUB_OUTPUT"
+
+        if [ "$manager" != none ] && grep -q '"packageManager"' package.json; then
+          echo "corepack=true" >> "$GITHUB_OUTPUT"
+        fi
+
+        echo "Package manager: $manager"
+
+    - name: Setup Node.js
+      if: steps.detect.outputs.manager != 'none'
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ steps.detect.outputs.node-version }}
+        node-version-file: ${{ steps.detect.outputs.node-version-file }}
+
+    - name: Setup Bun
+      if: steps.detect.outputs.manager == 'bun'
+      uses: oven-sh/setup-bun@v2
+
+    - name: Install and build
+      if: steps.detect.outputs.manager != 'none'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        MANAGER: ${{ steps.detect.outputs.manager }}
+        COREPACK: ${{ steps.detect.outputs.corepack }}
+        SCRIPT: ${{ inputs.script }}
+      run: |
+        set -eu
+
+        if [ "$COREPACK" = "true" ] && [ "$MANAGER" != bun ] && [ "$MANAGER" != npm ]; then
+          # Corepack is no longer bundled with Node.js 25+.
+          npm install --global --no-fund --no-audit corepack@latest
+          corepack enable
+        elif [ "$MANAGER" = pnpm ]; then
+          npm install --global --no-fund --no-audit pnpm
+        elif [ "$MANAGER" = yarn ] && ! command -v yarn >/dev/null; then
+          npm install --global --no-fund --no-audit yarn
+        fi
+
+        case "$MANAGER" in
+          bun)
+            bun install --frozen-lockfile
+            bun run "$SCRIPT"
+            ;;
+          pnpm)
+            pnpm install --frozen-lockfile
+            pnpm run "$SCRIPT"
+            ;;
+          yarn)
+            if [ "$(yarn --version | cut -d. -f1)" -ge 2 ]; then
+              yarn install --immutable
+            else
+              yarn install --frozen-lockfile
+            fi
+            yarn run "$SCRIPT"
+            ;;
+          npm)
+            if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+              npm ci --no-audit --no-fund
+            else
+              npm install --no-audit --no-fund
+            fi
+            npm run "$SCRIPT"
+            ;;
+        esac
